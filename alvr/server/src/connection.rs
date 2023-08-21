@@ -7,7 +7,7 @@ use crate::{
     statistics::StatisticsManager,
     tracking::{self, TrackingManager},
     FfiButtonValue, FfiFov, FfiViewsConfig, VideoPacket, BITRATE_MANAGER, DECODER_CONFIG,
-    SERVER_DATA_MANAGER, STATISTICS_MANAGER, VIDEO_MIRROR_SENDER, VIDEO_RECORDING_FILE,
+    SERVER_DATA_MANAGER, STATISTICS_MANAGER, VIDEO_MIRROR_BUS, VIDEO_RECORDING_FILE,
 };
 use alvr_audio::AudioDevice;
 use alvr_common::{
@@ -1125,8 +1125,8 @@ pub extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, i
                 .connection
                 .avoid_video_glitching
         {
-            if let Some(sender) = &*VIDEO_MIRROR_SENDER.lock() {
-                sender.send(payload.clone()).ok();
+            if let Some(sender) = &mut *VIDEO_MIRROR_BUS.lock() {
+                sender.try_broadcast(payload.clone()).ok();
             }
 
             if let Some(file) = &mut *VIDEO_RECORDING_FILE.lock() {

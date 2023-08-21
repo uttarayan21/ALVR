@@ -1,103 +1,47 @@
 use crate::{
     bindings::FfiButtonValue, connection::ClientDisconnectRequest, DECODER_CONFIG,
-    DISCONNECT_CLIENT_NOTIFIER, FILESYSTEM_LAYOUT, SERVER_DATA_MANAGER, VIDEO_MIRROR_SENDER,
-    VIDEO_RECORDING_FILE,
+    DISCONNECT_CLIENT_NOTIFIER, EVENTS_BUS, FILESYSTEM_LAYOUT, SERVER_DATA_MANAGER, SHUTTING_DOWN,
+    VIDEO_MIRROR_BUS, VIDEO_RECORDING_FILE,
 };
 use alvr_common::{
-    anyhow::{self, Result},
-    error, info, log, warn,
+    anyhow::{anyhow, Result},
+    error, info, log,
 };
-use alvr_events::{ButtonEvent, Event, EventType};
+use alvr_events::{ButtonEvent, EventType};
 use alvr_packets::{ButtonValue, ClientListAction, ServerRequest};
 use alvr_session::ConnectionState;
-use bytes::Buf;
-use futures::SinkExt;
-use headers::HeaderMapExt;
-use hyper::{
-    header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE},
-    service, Body, Request, Response, StatusCode,
+use bus::Bus;
+use rouille::{try_or_400, try_or_404, websocket, Response};
+use std::{
+    env,
+    fs::File,
+    sync::mpsc::Sender,
+    thread::{self, JoinHandle},
 };
-use serde::de::DeserializeOwned;
-use serde_json as json;
-use std::{net::SocketAddr, thread};
-use tokio::sync::broadcast::{self, error::RecvError};
-use tokio_tungstenite::{tungstenite::protocol, WebSocketStream};
-use tokio_util::codec::{BytesCodec, FramedRead};
 
 pub const WS_BROADCAST_CAPACITY: usize = 256;
 
-fn reply(code: StatusCode) -> Result<Response<Body>> {
-    Ok(Response::builder().status(code).body(Body::empty())?)
-}
+pub type WebserverHandles = (JoinHandle<()>, Sender<()>);
 
-async fn from_request_body<T: DeserializeOwned>(request: Request<Body>) -> Result<T> {
-    Ok(json::from_reader(
-        hyper::body::aggregate(request).await?.reader(),
-    )?)
-}
+pub fn webserver() -> Result<WebserverHandles> {
+    let web_server_port = SERVER_DATA_MANAGER
+        .read()
+        .settings()
+        .connection
+        .web_server_port;
 
-async fn websocket<T: Clone + Send + 'static>(
-    request: Request<Body>,
-    sender: broadcast::Sender<T>,
-    message_builder: impl Fn(T) -> protocol::Message + Send + Sync + 'static,
-) -> Result<Response<Body>> {
-    if let Some(key) = request.headers().typed_get::<headers::SecWebsocketKey>() {
-        tokio::spawn(async move {
-            match hyper::upgrade::on(request).await {
-                Ok(upgraded) => {
-                    let mut data_receiver = sender.subscribe();
+    let server = rouille::Server::new(("0.0.0.0", web_server_port), move |request| {
+        if SHUTTING_DOWN.value() {
+            // Service not available
+            return Response::text("Server is shutting down").with_status_code(503);
+        }
+        match request.url().as_str() {
+            "/api/dashboard-request" => {
+                let Some(body) = request.data() else {
+                    return Response::empty_400();
+                };
 
-                    let mut ws =
-                        WebSocketStream::from_raw_socket(upgraded, protocol::Role::Server, None)
-                            .await;
-
-                    loop {
-                        match data_receiver.recv().await {
-                            Ok(data) => {
-                                if let Err(e) = ws.send(message_builder(data)).await {
-                                    info!("Failed to send log with websocket: {e}");
-                                    break;
-                                }
-
-                                ws.flush().await.ok();
-                            }
-                            Err(RecvError::Lagged(_)) => {
-                                warn!("Some log lines have been lost because the buffer is full");
-                            }
-                            Err(RecvError::Closed) => break,
-                        }
-                    }
-
-                    ws.close(None).await.ok();
-                }
-                Err(e) => error!("{e}"),
-            }
-        });
-
-        let mut response = Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .body(Body::empty())?;
-
-        let h = response.headers_mut();
-        h.typed_insert(headers::Upgrade::websocket());
-        h.typed_insert(headers::SecWebsocketAccept::from(key));
-        h.typed_insert(headers::Connection::upgrade());
-
-        Ok(response)
-    } else {
-        reply(StatusCode::BAD_REQUEST)
-    }
-}
-
-async fn http_api(
-    request: Request<Body>,
-    events_sender: broadcast::Sender<Event>,
-) -> Result<Response<Body>> {
-    let mut response = match request.uri().path() {
-        // New unified requests
-        "/api/dashboard-request" => {
-            if let Ok(request) = from_request_body::<ServerRequest>(request).await {
-                match request {
+                match try_or_400!(serde_json::from_reader(body)) {
                     ServerRequest::Log(event) => {
                         let level = event.severity.into_log_level();
                         log::log!(level, "{}", event.content);
@@ -187,136 +131,128 @@ async fn http_api(
                     }
                 }
 
-                reply(StatusCode::OK)?
-            } else {
-                reply(StatusCode::BAD_REQUEST)?
+                Response::empty_204()
             }
-        }
-        "/api/events" => {
-            websocket(request, events_sender, |e| {
-                protocol::Message::Text(json::to_string(&e).unwrap())
-            })
-            .await?
-        }
-        "/api/video-mirror" => {
-            let sender = {
-                let mut sender_lock = VIDEO_MIRROR_SENDER.lock();
-                if let Some(sender) = &mut *sender_lock {
-                    sender.clone()
-                } else {
-                    let (sender, _) = broadcast::channel(WS_BROADCAST_CAPACITY);
-                    *sender_lock = Some(sender.clone());
+            "/api/events" => {
+                error!("subscribing to events!");
+                let (response, future_websocket) =
+                    try_or_400!(websocket::start::<&str>(request, None));
 
-                    sender
-                }
-            };
+                thread::spawn(move || {
+                    if let Ok(mut websocket) = future_websocket.recv() {
+                        let mut receiver = if let Some(bus) = &mut *EVENTS_BUS.lock() {
+                            bus.add_rx()
+                        } else {
+                            return;
+                        };
+                        let mut iter = receiver.iter();
 
-            if let Some(config) = &*DECODER_CONFIG.lock() {
-                sender.send(config.config_buffer.clone()).ok();
+                        while !SHUTTING_DOWN.value() {
+                            if let Some(data) = iter.next() {
+                                if let Err(e) =
+                                    websocket.send_text(&serde_json::to_string(&data).unwrap())
+                                {
+                                    info!("Failed to send log with websocket: {e:?}");
+                                    break;
+                                }
+                            }
+                        }
+                        error!("finished events websocket!");
+                    }
+                });
+
+                response
             }
+            "/api/video-mirror" => {
+                let (response, future_websocket) =
+                    try_or_400!(websocket::start::<&str>(request, None));
 
-            let res = websocket(request, sender, protocol::Message::Binary).await?;
+                thread::spawn({
+                    move || {
+                        if let Ok(mut websocket) = future_websocket.recv() {
+                            let mut receiver = {
+                                let mut bus_lock = VIDEO_MIRROR_BUS.lock();
+                                let bus = bus_lock.insert(Bus::new(WS_BROADCAST_CAPACITY));
 
-            unsafe { crate::RequestIDR() };
+                                let receiver = bus.add_rx();
 
-            res
-        }
-        "/api/set-buttons" => {
-            let buttons = from_request_body::<Vec<ButtonEvent>>(request).await?;
+                                if let Some(config) = &*DECODER_CONFIG.lock() {
+                                    bus.try_broadcast(config.config_buffer.clone()).ok();
+                                }
 
-            for button in buttons {
-                let value = match button.value {
-                    ButtonValue::Binary(value) => FfiButtonValue {
-                        type_: crate::FfiButtonType_BUTTON_TYPE_BINARY,
-                        __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 {
-                            binary: value.into(),
+                                receiver
+                            };
+
+                            unsafe { crate::RequestIDR() };
+
+                            let mut iter = receiver.iter();
+
+                            while !SHUTTING_DOWN.value() {
+                                if let Some(data) = iter.next() {
+                                    if let Err(e) = websocket.send_binary(&data) {
+                                        info!("Failed to send video packet with websocket: {e:?}");
+                                        break;
+                                    }
+                                }
+                            }
+                            error!("websocket finished!");
+                        }
+                    }
+                });
+
+                response
+            }
+            "/api/set-buttons" => {
+                let Some(body) = request.data() else {
+                    return Response::empty_400();
+                };
+
+                for button in try_or_400!(serde_json::from_reader::<_, Vec<ButtonEvent>>(body)) {
+                    let value = match button.value {
+                        ButtonValue::Binary(value) => FfiButtonValue {
+                            type_: crate::FfiButtonType_BUTTON_TYPE_BINARY,
+                            __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 {
+                                binary: value.into(),
+                            },
                         },
-                    },
 
-                    ButtonValue::Scalar(value) => FfiButtonValue {
-                        type_: crate::FfiButtonType_BUTTON_TYPE_SCALAR,
-                        __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 { scalar: value },
-                    },
-                };
+                        ButtonValue::Scalar(value) => FfiButtonValue {
+                            type_: crate::FfiButtonType_BUTTON_TYPE_SCALAR,
+                            __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 { scalar: value },
+                        },
+                    };
 
-                unsafe { crate::SetButton(alvr_common::hash_string(&button.path), value) };
+                    unsafe { crate::SetButton(alvr_common::hash_string(&button.path), value) };
+                }
+
+                Response::empty_204()
             }
+            "/api/ping" => Response::empty_204(),
+            mut other_uri => {
+                if other_uri == "/" {
+                    other_uri = "/index.html";
+                }
 
-            reply(StatusCode::OK)?
-        }
-        "/api/ping" => reply(StatusCode::OK)?,
-        other_uri => {
-            if other_uri.contains("..") {
-                // Attempted tree traversal
-                reply(StatusCode::FORBIDDEN)?
-            } else {
-                let path_branch = match other_uri {
-                    "/" => "/index.html",
-                    other_path => other_path,
-                };
-
-                let maybe_file = tokio::fs::File::open(format!(
-                    "{}{path_branch}",
-                    FILESYSTEM_LAYOUT.dashboard_dir().to_string_lossy(),
-                ))
-                .await;
-
-                if let Ok(file) = maybe_file {
-                    let mut builder = Response::builder();
-                    if other_uri.ends_with(".js") {
-                        builder = builder.header(CONTENT_TYPE, "text/javascript");
-                    }
-                    if other_uri.ends_with(".wasm") {
-                        builder = builder.header(CONTENT_TYPE, "application/wasm");
-                    }
-
-                    builder.body(Body::wrap_stream(FramedRead::new(file, BytesCodec::new())))?
+                let content_type = if other_uri.ends_with(".html") {
+                    "text/html"
+                } else if other_uri.ends_with(".js") {
+                    "text/javascript"
+                } else if other_uri.ends_with(".wasm") {
+                    "application/wasm"
                 } else {
-                    reply(StatusCode::NOT_FOUND)?
-                }
+                    "text/plain"
+                };
+
+                let file = try_or_404!(File::open(format!(
+                    "{}/ui{other_uri}",
+                    env::current_dir().unwrap().to_string_lossy(),
+                )));
+
+                Response::from_file(content_type, file)
             }
         }
-    };
+    })
+    .map_err(|e| anyhow!("{e}"))?;
 
-    response.headers_mut().insert(
-        CACHE_CONTROL,
-        HeaderValue::from_str("no-cache, no-store, must-revalidate")?,
-    );
-    response
-        .headers_mut()
-        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-
-    Ok(response)
-}
-
-pub async fn web_server(events_sender: broadcast::Sender<Event>) -> Result<()> {
-    let web_server_port = SERVER_DATA_MANAGER
-        .read()
-        .settings()
-        .connection
-        .web_server_port;
-
-    let service = service::make_service_fn(|_| {
-        let events_sender = events_sender.clone();
-        async move {
-            Ok::<_, anyhow::Error>(service::service_fn(move |request| {
-                let events_sender = events_sender.clone();
-                async move {
-                    let res = http_api(request, events_sender).await;
-                    if let Err(e) = &res {
-                        alvr_common::show_e(e);
-                    }
-
-                    res
-                }
-            }))
-        }
-    });
-
-    Ok(hyper::Server::bind(&SocketAddr::new(
-        "0.0.0.0".parse().unwrap(),
-        web_server_port,
-    ))
-    .serve(service)
-    .await?)
+    Ok(server.stoppable())
 }

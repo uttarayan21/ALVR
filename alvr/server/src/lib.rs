@@ -28,13 +28,15 @@ use alvr_common::{
     log,
     once_cell::sync::Lazy,
     parking_lot::{Mutex, RwLock},
+    RelaxedAtomic,
 };
-use alvr_events::EventType;
+use alvr_events::{Event, EventType};
 use alvr_filesystem::{self as afs, Layout};
 use alvr_packets::{ClientListAction, DecoderInitializationConfig, VideoPacketHeader};
 use alvr_server_io::ServerDataManager;
 use alvr_session::{CodecType, ConnectionState};
 use bitrate::BitrateManager;
+use bus::Bus;
 use connection::{ClientDisconnectRequest, DISCONNECT_CLIENT_NOTIFIER, SHOULD_CONNECT_TO_CLIENTS};
 use statistics::StatisticsManager;
 use std::{
@@ -49,7 +51,9 @@ use std::{
     time::{Duration, Instant},
 };
 use sysinfo::{ProcessRefreshKind, RefreshKind, SystemExt};
-use tokio::{runtime::Runtime, sync::broadcast};
+use web_server::WebserverHandles;
+
+static SHUTTING_DOWN: RelaxedAtomic = RelaxedAtomic::new(false);
 
 static FILESYSTEM_LAYOUT: Lazy<Layout> = Lazy::new(|| {
     afs::filesystem_layout_from_openvr_driver_root_dir(
@@ -58,9 +62,7 @@ static FILESYSTEM_LAYOUT: Lazy<Layout> = Lazy::new(|| {
 });
 static SERVER_DATA_MANAGER: Lazy<RwLock<ServerDataManager>> =
     Lazy::new(|| RwLock::new(ServerDataManager::new(&FILESYSTEM_LAYOUT.session())));
-static WEBSERVER_RUNTIME: Lazy<Mutex<Option<Runtime>>> =
-    Lazy::new(|| Mutex::new(Runtime::new().ok()));
-
+static WEBSERVER_HANDLES: Lazy<Mutex<Option<WebserverHandles>>> = Lazy::new(|| Mutex::new(None));
 static STATISTICS_MANAGER: Lazy<Mutex<Option<StatisticsManager>>> = Lazy::new(|| Mutex::new(None));
 static BITRATE_MANAGER: Lazy<Mutex<BitrateManager>> = Lazy::new(|| {
     let data_lock = SERVER_DATA_MANAGER.read();
@@ -76,12 +78,10 @@ pub struct VideoPacket {
     pub payload: Vec<u8>,
 }
 
-static VIDEO_MIRROR_SENDER: Lazy<Mutex<Option<broadcast::Sender<Vec<u8>>>>> =
-    Lazy::new(|| Mutex::new(None));
+static EVENTS_BUS: Lazy<Mutex<Option<Bus<Event>>>> =
+    Lazy::new(|| Mutex::new(Some(Bus::new(web_server::WS_BROADCAST_CAPACITY))));
+static VIDEO_MIRROR_BUS: Lazy<Mutex<Option<Bus<Vec<u8>>>>> = Lazy::new(|| Mutex::new(None));
 static VIDEO_RECORDING_FILE: Lazy<Mutex<Option<File>>> = Lazy::new(|| Mutex::new(None));
-
-// static DISCONNECT_CLIENT_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
-// static RESTART_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 
 static FRAME_RENDER_VS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderVS.cso");
 static FRAME_RENDER_PS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderPS.cso");
@@ -137,8 +137,20 @@ pub fn create_recording_file() {
 
 // This call is blocking
 pub extern "C" fn shutdown_driver() {
+    error!("shutting down...");
     // Invoke connection runtimes shutdown
     // todo: block until they shutdown
+    SHUTTING_DOWN.set(true);
+    *EVENTS_BUS.lock() = None;
+    *VIDEO_MIRROR_BUS.lock() = None;
+
+    let webserver_thread = if let Some((thread, notifier)) = WEBSERVER_HANDLES.lock().take() {
+        notifier.send(()).ok();
+        Some(thread)
+    } else {
+        None
+    };
+
     SHOULD_CONNECT_TO_CLIENTS.set(false);
 
     {
@@ -192,7 +204,11 @@ pub extern "C" fn shutdown_driver() {
         thread::sleep(Duration::from_millis(100));
     }
 
-    WEBSERVER_RUNTIME.lock().take();
+    if let Some(thread) = webserver_thread {
+        error!("joining webserver");
+        thread.join().ok();
+        error!("joined webserver");
+    }
 
     unsafe { ShutdownSteamvr() };
 }
@@ -225,8 +241,7 @@ pub fn restart_driver() {
 }
 
 fn init() {
-    let (events_sender, _) = broadcast::channel(web_server::WS_BROADCAST_CAPACITY);
-    logging_backend::init_logging(events_sender.clone());
+    logging_backend::init_logging();
 
     if SERVER_DATA_MANAGER
         .read()
@@ -239,9 +254,7 @@ fn init() {
 
     SERVER_DATA_MANAGER.write().clean_client_list();
 
-    if let Some(runtime) = WEBSERVER_RUNTIME.lock().as_mut() {
-        runtime.spawn(async { alvr_common::show_err(web_server::web_server(events_sender).await) });
-    }
+    *WEBSERVER_HANDLES.lock() = alvr_common::show_err(web_server::webserver());
 
     unsafe {
         g_sessionPath = CString::new(FILESYSTEM_LAYOUT.session().to_string_lossy().to_string())
@@ -337,8 +350,8 @@ pub unsafe extern "C" fn HmdDriverFactory(
 
         unsafe { ptr::copy_nonoverlapping(buffer_ptr, config_buffer.as_mut_ptr(), len as usize) };
 
-        if let Some(sender) = &*VIDEO_MIRROR_SENDER.lock() {
-            sender.send(config_buffer.clone()).ok();
+        if let Some(sender) = &mut *VIDEO_MIRROR_BUS.lock() {
+            sender.try_broadcast(config_buffer.clone()).ok();
         }
 
         if let Some(file) = &mut *VIDEO_RECORDING_FILE.lock() {
