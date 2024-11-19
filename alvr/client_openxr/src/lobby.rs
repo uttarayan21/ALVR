@@ -168,10 +168,7 @@ impl Lobby {
                     swapchain_index: right_swapchain_idx,
                 },
             ],
-            [
-                (left_hand_data.0.map(|dm| dm.pose), left_hand_data.1),
-                (right_hand_data.0.map(|dm| dm.pose), right_hand_data.1),
-            ],
+            [left_hand_data, right_hand_data],
             body_skeleton_fb,
             false,
         );

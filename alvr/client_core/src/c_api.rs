@@ -2,7 +2,7 @@ use crate::{
     graphics::{GraphicsContext, LobbyRenderer, RenderViewInput, StreamRenderer},
     storage,
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
-    ClientCapabilities, ClientCoreContext, ClientCoreEvent,
+    ClientCapabilities, ClientCoreContext, ClientCoreEvent, HandData,
 };
 use alvr_common::{
     anyhow::Result,
@@ -807,7 +807,18 @@ pub unsafe extern "C" fn alvr_render_lobby_opengl(
         if let Some(renderer) = renderer {
             renderer.render(
                 view_inputs,
-                [(None, None), (None, None)],
+                [
+                    HandData {
+                        grip_motion: None,
+                        detached_grip_motion: None,
+                        skeleton_joints: None,
+                    },
+                    HandData {
+                        grip_motion: None,
+                        detached_grip_motion: None,
+                        skeleton_joints: None,
+                    },
+                ],
                 None,
                 render_background,
             );

@@ -42,6 +42,12 @@ use storage::Config;
 pub use alvr_system_info::Platform;
 pub use logging_backend::init_logging;
 
+pub struct HandData {
+    pub grip_motion: Option<DeviceMotion>,
+    pub detached_grip_motion: Option<DeviceMotion>,
+    pub skeleton_joints: Option<[Pose; 26]>,
+}
+
 pub enum ClientCoreEvent {
     UpdateHudMessage(String),
     StreamingStarted(Box<StreamConfig>),

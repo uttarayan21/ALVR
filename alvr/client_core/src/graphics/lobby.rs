@@ -1,4 +1,5 @@
 use super::{GraphicsContext, SDR_FORMAT};
+use crate::HandData;
 use alvr_common::{
     glam::{IVec2, Mat4, Quat, UVec2, Vec3, Vec4},
     Fov, Pose,
@@ -245,7 +246,7 @@ impl LobbyRenderer {
             device,
             "lobby_line",
             &[],
-            64,
+            68,
             include_wgsl!("../../resources/lobby_line.wgsl"),
             PrimitiveTopology::LineList,
         );
@@ -375,7 +376,7 @@ impl LobbyRenderer {
     pub fn render(
         &self,
         view_inputs: [RenderViewInput; 2],
-        hand_data: [(Option<Pose>, Option<[Pose; 26]>); 2],
+        hand_data: [HandData; 2],
         body_skeleton_fb: Option<Vec<Option<Pose>>>,
         render_background: bool,
     ) {
@@ -459,8 +460,14 @@ impl LobbyRenderer {
 
             // Render hands and body skeleton
             pass.set_pipeline(&self.line_pipeline);
-            for (maybe_pose, maybe_skeleton) in &hand_data {
-                if let Some(skeleton) = maybe_skeleton {
+            for data in &hand_data {
+                if let Some(skeleton) = data.skeleton_joints {
+                    pass.set_push_constants(
+                        ShaderStages::VERTEX_FRAGMENT,
+                        64,
+                        &[255, 255, 255, 255],
+                    );
+
                     for (joint1_idx, joint2_idx) in HAND_SKELETON_BONES {
                         let j1_pose = skeleton[joint1_idx];
                         let j2_pose = skeleton[joint2_idx];
@@ -474,7 +481,14 @@ impl LobbyRenderer {
                     }
                 }
 
-                if let Some(pose) = maybe_pose {
+                fn draw_controller_crossair(
+                    pass: &mut RenderPass,
+                    pose: Pose,
+                    view_proj: Mat4,
+                    color: &[u8],
+                ) {
+                    pass.set_push_constants(ShaderStages::VERTEX_FRAGMENT, 64, &color);
+
                     let hand_transform = Mat4::from_scale_rotation_translation(
                         Vec3::ONE * 0.2,
                         pose.orientation,
@@ -491,8 +505,21 @@ impl LobbyRenderer {
                             * *rot
                             * Mat4::from_scale(Vec3::ONE * 0.5)
                             * Mat4::from_translation(Vec3::Z * 0.5);
-                        transform_draw(&mut pass, view_proj * transform, 2);
+                        transform_draw(pass, view_proj * transform, 2);
                     }
+                }
+
+                if let Some(motion) = data.grip_motion {
+                    draw_controller_crossair(
+                        &mut pass,
+                        motion.pose,
+                        view_proj,
+                        &[255, 255, 255, 255],
+                    );
+                }
+
+                if let Some(motion) = data.detached_grip_motion {
+                    draw_controller_crossair(&mut pass, motion.pose, view_proj, &[50, 50, 50, 255]);
                 }
             }
             if let Some(skeleton) = &body_skeleton_fb {

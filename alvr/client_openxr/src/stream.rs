@@ -481,7 +481,7 @@ fn stream_input_loop(
 
         device_motions.push((*HEAD_ID, head_motion));
 
-        let (left_hand_motion, left_hand_skeleton) = crate::interaction::get_hand_data(
+        let left_hand_data = crate::interaction::get_hand_data(
             &xr_ctx.session,
             &reference_space,
             xr_now,
@@ -489,7 +489,7 @@ fn stream_input_loop(
             &mut last_controller_poses[0],
             &mut last_palm_poses[0],
         );
-        let (right_hand_motion, right_hand_skeleton) = crate::interaction::get_hand_data(
+        let right_hand_data = crate::interaction::get_hand_data(
             &xr_ctx.session,
             &reference_space,
             xr_now,
@@ -500,13 +500,13 @@ fn stream_input_loop(
 
         // Note: When multimodal input is enabled, we are sure that when free hands are used
         // (not holding controllers) the controller data is None.
-        if interaction_ctx.uses_multimodal_hands || left_hand_skeleton.is_none() {
-            if let Some(motion) = left_hand_motion {
+        if interaction_ctx.uses_multimodal_hands || left_hand_data.skeleton_joints.is_none() {
+            if let Some(motion) = left_hand_data.grip_motion {
                 device_motions.push((*HAND_LEFT_ID, motion));
             }
         }
-        if interaction_ctx.uses_multimodal_hands || right_hand_skeleton.is_none() {
-            if let Some(motion) = right_hand_motion {
+        if interaction_ctx.uses_multimodal_hands || right_hand_data.skeleton_joints.is_none() {
+            if let Some(motion) = right_hand_data.grip_motion {
                 device_motions.push((*HAND_RIGHT_ID, motion));
             }
         }
@@ -538,7 +538,10 @@ fn stream_input_loop(
         core_ctx.send_tracking(
             Duration::from_nanos(xr_now.as_nanos() as u64),
             device_motions,
-            [left_hand_skeleton, right_hand_skeleton],
+            [
+                left_hand_data.skeleton_joints,
+                right_hand_data.skeleton_joints,
+            ],
             face_data,
         );
 
