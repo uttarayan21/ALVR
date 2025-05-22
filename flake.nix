@@ -2,6 +2,7 @@
   description = "Flake utils demo";
 
   inputs.flake-utils.url = "github:numtide/flake-utils";
+  inputs.self.submodules = true;
 
   outputs = {
     self,
