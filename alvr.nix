@@ -44,7 +44,7 @@ rustPlatform.buildRustPackage rec {
 
   useFetchCargoVendor = true;
   # cargoHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-  cargoHash = "sha256-3s+aaepng5MPN5lbdrpbGrz09J3ewFmSB5nOoiZk+84=";
+  cargoHash = "sha256-EU90mR8uQpl0uimzbqWEZC0GSNvKehN9kX2MTz3yZn4=";
   dontStrip = true;
 
   patches = [
